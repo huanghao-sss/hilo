@@ -260,13 +260,15 @@ net = hilo.meta.meta_train_truncated(Task(), hilo.HiloNet(seed=0), estimator="nr
 1. **写任务**：先写全程 ES 的 `objective`，或 PES / NRES 的 `Task`。设置确定性：
    `CUBLAS_WORKSPACE_CONFIG=:4096:8` 和 `torch.use_deterministic_algorithms(True)`；
    同一个 HiloNet、同一个任务种子跑两次，结果应逐位相同。截断任务再检查一次"分段跑"和"一口气跑"一致。
-2. **小规模试跑**：几次外层更新，看 `pair_absdiff` 是否明显大于 0、`dead` 是否为 0。
-3. **元训练**：用 `out=` 保存日志与检查点（每 `save_every` 次一个 `hilo_itXXXX.pt`），中断后用同一个 `out` 续跑。
+2. **选起点**：`hilo.init_net("random" | "muon" | "path.pt", cfg)`。`muon` 先把 HiloNet 蒸馏成 Muon 方向的近似
+   （见 README 的"初始化"一节），元训练从一个已经能用的优化器开始。
+3. **小规模试跑**：几次外层更新，看 `pair_absdiff` 是否明显大于 0、`dead` 是否为 0。
+4. **元训练**：用 `out=` 保存日志与检查点（每 `save_every` 次一个 `hilo_itXXXX.pt`），中断后用同一个 `out` 续跑。
    多张卡时用 `make_objective` / `make_task` + `devices` 并行。
-4. **留出评估**：在元训练没见过的任务种子上，把新 HiloNet 和对照（随机初始化、上一个检查点或手工优化器）配对比较，
+5. **留出评估**：在元训练没见过的任务种子上，把新 HiloNet 和对照（随机初始化、上一个检查点或手工优化器）配对比较，
    看平均损失差和标准误（`meta_train_proxy.py --eval A --against B`）。
-5. **逐步放大**：用 `HiloNet.load(...)` 作为下一阶段的起点，在更宽、更长、更接近目标的任务上继续元训练。
-6. **使用**：`hilo.Hilo(mats, total_steps=T, lr=<元训练时的 lr>, net="runs/.../hilo_final.pt")`，
+6. **逐步放大**：用 `HiloNet.load(...)` 作为下一阶段的起点，在更宽、更长、更接近目标的任务上继续元训练。
+7. **使用**：`hilo.Hilo(mats, total_steps=T, lr=<元训练时的 lr>, net="runs/.../hilo_final.pt")`，
    执行选项（`precision` 等）与元训练保持一致。
 
 ## 12. 并行

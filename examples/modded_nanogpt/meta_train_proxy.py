@@ -262,7 +262,8 @@ def main():
     ap.add_argument("--mbs", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-3, help="Hilo lr (use the same one in train_gpt_hilo.py)")
     ap.add_argument("--out", default="runs/proxy")
-    ap.add_argument("--init", help="start from a saved HiloNet (.pt) instead of a random init")
+    ap.add_argument("--init", default="random", help="starting HiloNet: random, muon (distilled toward Muon "
+                    "first, cached in OUT/init_muon.pt; see hilo.distill) or a saved HiloNet (.pt)")
     ap.add_argument("--config", help="HiloNetConfig as JSON, e.g. '{\"tie\": 6, \"output_norm\": \"rms\"}'")
     ap.add_argument("--seed", type=int, default=0, help="random init of the HiloNet and ES noise")
     ap.add_argument("--estimator", default="es", choices=("es",) + hilo.meta.ESTIMATORS,
@@ -312,8 +313,9 @@ def main():
         print(json.dumps(summary))
         return
 
-    net = hilo.HiloNet.load(a.init) if a.init else hilo.HiloNet(
-        HiloNetConfig(**json.loads(a.config)) if a.config else None, seed=a.seed)
+    Path(a.out).mkdir(parents=True, exist_ok=True)
+    net = hilo.init_net(a.init, HiloNetConfig(**json.loads(a.config)) if a.config else None, a.seed,
+                        out=str(Path(a.out) / "init_muon.pt"))
     print(f"meta-training {net!r} on proxy {a.layers}x{a.dim}, {a.steps} steps, {a.estimator}", flush=True)
     meta = dict(iters=a.iters, pairs=a.pairs, sigma_mult=a.sigma_mult, momentum=a.momentum, optimizer=a.optimizer,
                 shaping=a.shaping, seed=a.seed, out=a.out, save_every=a.save_every, net_options=net_options)

@@ -216,6 +216,23 @@ def test_meta_train_truncated_serial_and_parallel():
         assert torch.allclose(ser.flat(), par.flat(), atol=1e-6), (estimator, (ser.flat() - par.flat()).abs().max())
 
 
+def test_distill_muon():
+    """Newton-Schulz lands in Muon's singular-value band; a few distillation steps raise the cosine to Muon."""
+    from hilo import distill
+
+    s = torch.linalg.svdvals(distill.newton_schulz(torch.randn(3, 40, 16)))
+    assert 0.6 < s.min() and s.max() < 1.2, s
+    cfg = hilo.HiloNetConfig(d=8, heads=2, mlp_hidden=8, tie=2)
+    teacher, extra = distill.muon_teacher()
+    shapes = ((24, 16), (16, 24))
+    kw = dict(shapes=shapes, device="cpu")
+    before = sum(distill.evaluate(hilo.HiloNet(cfg), teacher, extra, **kw).values()) / 2
+    net = distill.distill(hilo.HiloNet(cfg), teacher, extra, steps=40, lr=3e-3, log_every=0, **kw)
+    after = sum(distill.evaluate(net, teacher, extra, **kw).values()) / 2
+    assert after > before + 0.2, (before, after)
+    assert torch.equal(hilo.init_net("random", cfg, seed=3).flat(), hilo.HiloNet(cfg, seed=3).flat())
+
+
 def test_shaping():
     import hilo.meta
 

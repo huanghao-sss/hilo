@@ -123,18 +123,28 @@ def _attn(a: Tensor, w: dict, pre: str, heads: int, attn: str, dt: torch.dtype) 
     return out.view(B, T, Fn, d)
 
 
+def head_weights(phi: dict, heads: int, dt: torch.dtype = torch.float32) -> dict:
+    """The attention weights of phi split per head (contiguous, in dtype dt), as hilo_net takes them."""
+    w = {}
+    for name, v in phi.items():
+        if name[-2:-1] in ("r", "c") and name[-1] in "qkvo":
+            parts = v.chunk(heads, dim=0 if name[-1] == "o" else 1)
+            w[name] = [p.contiguous().to(dt) for p in parts]
+    return w
+
+
 def hilo_net(chan: Tensor, glob: Tensor, phi: dict, w: dict, *, iters: int, tie: bool, heads: int, attn: str,
              dt: torch.dtype = torch.float32) -> Tensor:
     """chan [B, m, n, C] normalized channels, glob [B, n_glob] -> raw update X [B, m, n].
-    phi: parameters; w: per-head attention weights in dtype dt (see HiloNet._to). The residual stream,
+    phi: parameters; w: per-head attention weights in dtype dt (head_weights). The residual stream,
     norms and MLP stay in float32; attention matmuls run in dt."""
     h = chan @ phi["E"] + (glob @ phi["Eg"])[:, None, None, :]
     for i in range(iters):
         b = 0 if tie else i
-        h += _attn(_cn(h), w, f"{b}r", heads, attn, dt)
-        h += _attn(_cn(h).transpose(1, 2), w, f"{b}c", heads, attn, dt).transpose(1, 2)
+        h = h + _attn(_cn(h), w, f"{b}r", heads, attn, dt)
+        h = h + _attn(_cn(h).transpose(1, 2), w, f"{b}c", heads, attn, dt).transpose(1, 2)
         z = F.silu(_cn(h) @ phi[f"{b}m1"] + phi[f"{b}mb1"])
-        h += z @ phi[f"{b}m2"] + phi[f"{b}mb2"]
+        h = h + z @ phi[f"{b}m2"] + phi[f"{b}mb2"]
     return h @ phi["out"]
 
 
@@ -228,16 +238,10 @@ class HiloNet:
         return cls(HiloNetConfig(**cfg), phi=ckpt["phi"], **options)
 
     def _to(self, device: torch.device) -> None:
-        """Move parameters to `device` and split the attention weights per head (contiguous, in the matmul dtype)."""
+        """Move parameters to `device` and split the attention weights per head (in the matmul dtype)."""
         self.phi = {k: v.to(device) for k, v in self.phi.items()}
         self._mode = self.precision if self.precision != "auto" else "bf16" if device.type == "cuda" else "fp32"
-        dt, dk, H = PRECISIONS[self._mode], self.cfg.d // self.cfg.heads, self.cfg.heads
-        self._w = {}
-        for name, v in self.phi.items():
-            if name[-1] in "qkv" and name[-2] in "rc":
-                self._w[name] = [v[:, h * dk:(h + 1) * dk].contiguous().to(dt) for h in range(H)]
-            elif name[-1] == "o" and name[-2] in "rc":
-                self._w[name] = [v[h * dk:(h + 1) * dk].contiguous().to(dt) for h in range(H)]
+        self._w = head_weights(self.phi, self.cfg.heads, PRECISIONS[self._mode])
 
     @torch.no_grad()
     def __call__(self, G: Tensor, M: Tensor, W: Tensor, progress: float) -> Tensor:

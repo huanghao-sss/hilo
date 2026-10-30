@@ -9,8 +9,9 @@ hilo 是一个**学习型矩阵优化器（learned optimizer）的通用框架**
 | `hilo.Hilo` | 优化器（`torch.optim.Optimizer` 接口），支持多卡分片计算 |
 | `hilo.HiloNet` / `HiloNetConfig` | 可配置的 HiloNet 架构，默认随机初始化，可保存 / 加载 |
 | `hilo.meta` | 元训练：全程对偶 ES，截断展开的 PES / NRES；目标函数就是你自己的训练循环 |
+| `hilo.distill` | 可选的初始化：把 HiloNet 蒸馏成 Muon 更新方向的近似，作为元训练的起点 |
 
-`HiloNet` 默认随机初始化；在你的任务族上元训练后，把保存的 `.pt` 交给 `Hilo`。
+`HiloNet` 默认随机初始化，也可以先蒸馏成 Muon 的近似（`hilo.init_net("muon")`）；在你的任务族上元训练后，把保存的 `.pt` 交给 `Hilo`。
 
 ## 为什么用学习型优化器
 
@@ -42,6 +43,9 @@ hilo 按这个思路设计：
   也没有学习率日程，怎样利用这些信号完全由元训练决定。
 - **只保留问题结构。** 保留的结构只与问题的形状有关：对矩阵行、列置换等变，因此一个网络适用于任意形状的矩阵；
   对输入整体缩放不变。这就像卷积对平移的等变：它描述问题的形状，而不规定解法。
+
+起点由你选择：默认的随机初始化不带任何关于更新规则的假设；`hilo.distill` 可以先把 HiloNet 蒸馏到 Muon 附近，
+再由元训练在此基础上改进。
 
 代价是每步要运行一个网络，并且需要元训练的算力。
 
@@ -130,6 +134,47 @@ A100 上（与其他任务共用 GPU 时测得）默认配置单个矩阵的耗�
 | 768×768 | 0.13–0.22 s | 0.09 s | 0.06 s |
 | 3072×768 | 1.2–1.4 s | 0.37 s | 0.11–0.26 s |
 
+## 初始化（`hilo.distill`）
+
+| `init` | 起点 |
+|---|---|
+| `random`（默认） | 随机初始化，残差分支为零，起点是归一化通道的逐坐标线性组合 |
+| `muon` | 从同一个随机初始化出发，把更新蒸馏成 Muon 的方向：Nesterov 动量 0.95，5 步 Newton–Schulz 正交化 |
+| `*.pt` | 保存的 HiloNet |
+
+```python
+import hilo, hilo.distill
+
+net = hilo.init_net("muon", cfg, seed=0, out="hilo_muon.pt")   # out 已存在时直接加载
+net = hilo.distill.muon(cfg, steps=3000)                       # 同上，可调蒸馏参数
+```
+
+```bash
+python -m hilo.distill --out hilo_muon.pt --steps 3000 [--config '{"tie": 6}']
+```
+
+蒸馏在合成的梯度统计上做回归：每个矩阵有一个信号 S（随机奇异向量、幂律奇异值谱、随机的行列尺度），
+梯度是 S 加上强度随机的高斯噪声。G、HiloNet 的各个梯度 EMA 和 Muon 的动量按平稳状态下的精确联合分布采样，
+损失是 HiloNet 的更新与 Muon 方向之间的相对平方误差。任意 `HiloNetConfig` 都能蒸馏；默认配置 3000 步在 A100 上约 10 分钟。
+
+目标更新的 RMS 为 1，所以 `Hilo` 的 `lr` 就是每步更新的 RMS。Muon 的更新是正交化结果乘以 √max(1, m/n)，
+RMS 约为 1/√n（n 为输入维度），对应的 Hilo lr 约为 Muon lr / √n。
+
+效果（默认配置，3000 步）：
+
+- 与 Muon 方向的余弦相似度：训练用的形状（32–256 维）上 0.84–0.90；没见过的 768×768 为 0.91，3072×768 为 0.87，
+  768×3072 为 0.88；长宽比 4:1 的 512×128 和 128×512 约为 0.73。
+- 在元训练教程第 7 节的缩小版 modded-nanogpt 上（8 个留出任务的终点验证损失）：
+
+| Hilo 的更新 | lr 1e-3 | lr 3e-3 | lr 1e-2 |
+|---|---|---|---|
+| 随机初始化的 HiloNet | 9.44 | | |
+| 随机初始化后用 NRES 元训练 160 次（约 2.2 小时） | 7.22 | | |
+| Muon 方向本身（RMS 归一化） | 7.07 | 7.11 | 7.16 |
+| 蒸馏得到的 HiloNet | 7.09 | 7.20 | 7.27 |
+
+  lr 1e-3 时，蒸馏得到的 HiloNet 只比 Muon 方向本身高 0.017 ± 0.005（配对比较），比随机初始化后元训练 160 次的结果低 0.13。
+
 ## 元训练（`hilo.meta`）
 
 **完整教程：[docs/meta_training.md](docs/meta_training.md)。** 内容包括：两层优化与术语、ES 为什么只用损失值就能估计梯度、
@@ -179,6 +224,8 @@ hilo/
 │   ├── optim.py                # Hilo 优化器（动量状态、分片、权重衰减）、split_params
 │   ├── net.py                  # HiloNet、HiloNetConfig：(G, M, W, t/T) -> U，随机初始化、保存/加载
 │   ├── norms.py                # 更新范数选项：none / rms / frobenius / row
+│   ├── init.py                 # init_net：random / muon / 保存的 .pt
+│   ├── distill.py              # 蒸馏到 Muon 方向：muon、distill、newton_schulz
 │   └── meta/                   # 元训练
 │       ├── es.py               #   全程 ES：meta_train、FullES
 │       ├── truncated.py        #   截断展开：meta_train_truncated、TruncatedES（PES / NRES）
@@ -188,7 +235,7 @@ hilo/
 │   └── meta_training.md        # 元训练教程：ES、PES、NRES 的原理、实测对比与用法
 ├── examples/
 │   ├── quickstart.py           # 最小用法（CPU）
-│   ├── meta_train.py           # 在 MLP 任务族上从随机初始化元训练
+│   ├── meta_train.py           # 在 MLP 任务族上元训练（--init random|muon|*.pt）
 │   └── modded_nanogpt/         # modded-nanogpt #36 官方基线接入
 │       ├── README.md
 │       ├── train_gpt_hilo.py   #   官方 train_gpt_simple.py：Muon -> hilo.Hilo
@@ -206,7 +253,7 @@ hilo/
 ## 测试
 
 ```bash
-python tests/test_hilo.py          # 与参考实现逐步对比、保存/加载、各更新范数、权重衰减、state_dict、元训练
+python tests/test_hilo.py          # 与参考实现逐步对比、保存/加载、各更新范数、权重衰减、state_dict、元训练、蒸馏
 python tests/test_distributed.py   # 2 进程分片与单进程结果一致
 ```
 

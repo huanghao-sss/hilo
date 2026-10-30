@@ -30,6 +30,8 @@ ap.add_argument("--trunc", type=int, default=20, help="pes / nres: steps per out
 ap.add_argument("--lr", type=float, default=1e-3, help="Hilo lr during meta-training (keep it when using the net)")
 ap.add_argument("--output-norm", default="none", choices=hilo.OUTPUT_NORMS)
 ap.add_argument("--sigma-mult", type=float, default=1.0)
+ap.add_argument("--init", default="random", help="starting HiloNet: random, muon (distilled toward Muon, "
+                "see hilo.distill) or a saved HiloNet (.pt)")
 ap.add_argument("--seed", type=int, default=0, help="random init of the HiloNet and ES noise")
 ap.add_argument("--out", default="runs/meta_mlp")
 ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -69,7 +71,7 @@ def objective(net: hilo.HiloNet, task_seed: int) -> float:
         return F.mse_loss(st["model"](xval), st["teacher"](xval)).item()
 
 
-net = hilo.HiloNet(hilo.HiloNetConfig(output_norm=args.output_norm), seed=args.seed)
+net = hilo.init_net(args.init, hilo.HiloNetConfig(output_norm=args.output_norm), args.seed, device=args.device)
 meta = dict(iters=args.iters, pairs=args.pairs, sigma_mult=args.sigma_mult, seed=args.seed, out=args.out)
 if args.estimator == "es":
     net = hilo.meta.meta_train(objective, net, **meta)

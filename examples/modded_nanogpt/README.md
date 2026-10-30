@@ -48,6 +48,7 @@ torchrun --standalone --nproc_per_node=8 train_gpt_hilo.py
 ```bash
 python meta_train_proxy.py --out runs/proxy --iters 100 --pairs 8                       # 从随机初始化开始
 python meta_train_proxy.py --config '{"output_norm": "rms", "tie": 6}' --out runs/proxy_rms  # 换架构 / 更新范数
+python meta_train_proxy.py --init muon --estimator nres --trunc 50 --iters 2000 --out runs/proxy_muon  # 从 Muon 蒸馏起步
 python meta_train_proxy.py --init runs/proxy/hilo_final.pt --steps 600 --out runs/proxy2  # 加长代理继续训练
 python meta_train_proxy.py --estimator nres --trunc 50 --min-steps 100 --steps 1000 --iters 2000 \
     --out runs/proxy_nres
