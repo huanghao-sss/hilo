@@ -9,7 +9,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import hilo  # noqa: E402
+import Hilo  # noqa: E402
 
 SHAPES = [(24, 16), (16, 24), (20, 20), (24, 16), (12, 12)]
 
@@ -17,7 +17,7 @@ SHAPES = [(24, 16), (16, 24), (20, 20), (24, 16), (12, 12)]
 def run(steps=5):
     torch.manual_seed(0)
     ps = [(torch.randn(s) * 0.1).requires_grad_() for s in SHAPES]
-    opt = hilo.Hilo(ps, lr=0.02, total_steps=steps)
+    opt = Hilo.optimizer(ps, lr=0.02, total_steps=steps)
     g = torch.Generator().manual_seed(1)
     for _ in range(steps):
         for p in ps:

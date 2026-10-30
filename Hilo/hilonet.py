@@ -1,4 +1,4 @@
-"""HiloNet: the matrix Transformer at the core of hilo (HiHiTech's Learned Optimizer).
+"""HiloNet: the matrix Transformer at the core of Hilo (HiHiTech's Learned Optimizer).
 
 Per matrix W (m x n) every coordinate carries the channels [G, M_beta_1, ..., M_beta_k, W] (M_beta are EMAs
 of the gradient), each divided by its tensor RMS and clipped at +-20 (scale equivariance). A global context
@@ -7,11 +7,11 @@ Coordinates are embedded to d dimensions and mixed by blocks of [row attention -
 with residuals and RMSNorm. Row attention treats rows as tokens and scores row pairs by channel bilinear
 forms summed over all columns (with one channel and linear attention the score matrix is X X^T), so the
 network is equivariant to row and column permutations and applies to any matrix shape. A linear read-out
-gives X, and the update is U = normalize(X, output_norm) (see hilo.norms). The parameters are
-meta-trained with hilo.meta.
+gives X, and the update is U = normalize(X, output_norm) (see Hilo.norms). The parameters are
+meta-trained with Hilo.meta.
 
-A new HiloNet is randomly initialized with the residual branches at zero, so it starts as a per-coordinate
-linear map of the normalized channels.
+The random init has the residual branches at zero, so a new HiloNet is a per-coordinate linear map of the
+normalized channels.
 """
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from .norms import OUTPUT_NORMS, normalize
 
 @dataclass
 class HiloNetConfig:
+    """Hilo.config: the HiloNet architecture (saved with the network)."""
     d: int = 16                      # embedding width per coordinate
     heads: int = 2
     mlp_hidden: int = 32
@@ -37,7 +38,7 @@ class HiloNetConfig:
     attn: str = "linear"             # "linear" (scores / m) or "softmax"
     betas: tuple = (0.5, 0.9, 0.99, 0.999)
     clip: float = 20.0
-    output_norm: str = "none"        # "none" | "rms" | "frobenius" | "row", see hilo.norms
+    output_norm: str = "none"        # "none" | "rms" | "frobenius" | "row", see Hilo.norms
     extra: dict = field(default_factory=dict)
 
     def __post_init__(self):
@@ -181,21 +182,25 @@ def _compiled_net():
     return _COMPILED
 
 
+BACKENDS = ("auto", "triton", "torch")
 PRECISIONS = {"auto": None, "fp32": torch.float32, "tf32": torch.float32, "bf16": torch.bfloat16}
 
 
 class HiloNet:
-    """The hilo network: (G, M, W, progress) of a batch of same-shape matrices -> updates U.
+    """Hilo.net, the HiloNet: (G, M, W, progress) of a batch of same-shape matrices -> updates U.
 
-        HiloNet()                         random init (seed 0), default config
-        HiloNet(HiloNetConfig(...), seed) random init, custom architecture
-        HiloNet.load("hilo.pt")           parameters saved with .save() or by hilo.meta
-        HiloNet(cfg, phi=flat)            explicit flat parameters (used by meta-training)
+        Hilo.net()                          random init (seed 0), default config
+        Hilo.net(Hilo.config(...), seed)    random init, custom architecture
+        Hilo.net.load("net.pt")             parameters saved with .save() or by Hilo.meta
+        Hilo.net(cfg, phi=flat)             explicit flat parameters (used by meta-training)
 
     Execution options (not part of the saved network; meta-train and train with the same precision):
         precision: dtype of the attention matmuls: "bf16", "tf32", "fp32" (exact reference) or "auto"
             (default: bf16 on CUDA, fp32 on CPU). The residual stream, norms and MLP are float32 in all modes.
-        compile: torch.compile the network (one compilation per matrix shape).
+        backend: "auto" (default) runs the fused Triton kernels (Hilo.kernels) on CUDA in bf16 when Triton is
+            installed and d, mlp_hidden are powers of two >= 16, otherwise the PyTorch implementation;
+            "triton" requires the kernels, "torch" never uses them.
+        compile: torch.compile the PyTorch implementation (one compilation per matrix shape).
         max_coords: matrices of one shape are processed in chunks of at most this many coordinates
             (bounds peak memory, about 0.5 KB per coordinate).
 
@@ -204,18 +209,22 @@ class HiloNet:
     """
 
     def __init__(self, config: HiloNetConfig | None = None, seed: int = 0, phi: Tensor | None = None,
-                 precision: str = "auto", compile: bool = False, max_coords: int = 2 ** 23):
+                 precision: str = "auto", backend: str = "auto", compile: bool = False,
+                 max_coords: int = 2 ** 23):
         self.cfg = config or HiloNetConfig()
         assert precision in PRECISIONS, (precision, list(PRECISIONS))
+        assert backend in BACKENDS, (backend, BACKENDS)
         spec = param_spec(self.cfg)
-        flat = (init_flat(self.cfg, seed) if phi is None else phi).detach().float().reshape(-1)
+        if phi is None:
+            phi = init_flat(self.cfg, seed)
+        flat = phi.detach().float().reshape(-1)
         assert flat.numel() == sum(math.prod(s) for _, s in spec), (flat.numel(), n_params(self.cfg))
         self.phi, i = {}, 0
         for name, shp in spec:
             k = math.prod(shp)
             self.phi[name] = flat[i:i + k].reshape(shp)
             i += k
-        self.precision, self.max_coords = precision, max_coords
+        self.precision, self.backend, self.max_coords = precision, backend, max_coords
         self._w = None
         self.compile = compile
         self._net = _compiled_net() if compile else hilo_net
@@ -232,7 +241,7 @@ class HiloNet:
 
     @classmethod
     def load(cls, path: str | Path, **options) -> "HiloNet":
-        """options: precision, compile, max_coords."""
+        """options: precision, backend, compile, max_coords."""
         ckpt = torch.load(path, map_location="cpu", weights_only=True)
         cfg = json.loads(ckpt["config"]) if isinstance(ckpt["config"], str) else ckpt["config"]
         return cls(HiloNetConfig(**cfg), phi=ckpt["phi"], **options)
@@ -242,6 +251,17 @@ class HiloNet:
         self.phi = {k: v.to(device) for k, v in self.phi.items()}
         self._mode = self.precision if self.precision != "auto" else "bf16" if device.type == "cuda" else "fp32"
         self._w = head_weights(self.phi, self.cfg.heads, PRECISIONS[self._mode])
+        self._triton = None
+        if self.backend != "torch" and device.type == "cuda" and self._mode == "bf16":
+            try:
+                from . import kernels
+                if kernels.supported(self.cfg):
+                    self._triton = kernels.hilo_net_triton
+            except ImportError:
+                pass
+        if self.backend == "triton" and self._triton is None:
+            raise RuntimeError("backend='triton' needs CUDA, precision bf16, Triton, and d / mlp_hidden powers of "
+                               f"two >= 16 (device {device}, precision {self._mode}, {self.cfg})")
 
     @torch.no_grad()
     def __call__(self, G: Tensor, M: Tensor, W: Tensor, progress: float) -> Tensor:
@@ -256,8 +276,11 @@ class HiloNet:
             Us = []
             for i in range(0, B, step):
                 chan, glob = features(G[i:i + step], M[i:i + step], W[i:i + step], progress, self.cfg.clip)
-                X = self._net(chan, glob, self.phi, self._w, iters=self.cfg.iters, tie=bool(self.cfg.tie),
-                              heads=self.cfg.heads, attn=self.cfg.attn, dt=PRECISIONS[self._mode])
+                kw = dict(iters=self.cfg.iters, tie=bool(self.cfg.tie), heads=self.cfg.heads, attn=self.cfg.attn)
+                if self._triton is not None:
+                    X = self._triton(chan, glob, self.phi, **kw)
+                else:
+                    X = self._net(chan, glob, self.phi, self._w, dt=PRECISIONS[self._mode], **kw)
                 Us.append(normalize(X, self.cfg.output_norm))
         finally:
             torch.backends.cuda.matmul.allow_tf32 = tf32

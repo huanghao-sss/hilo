@@ -4,8 +4,8 @@ train_gpt_simple.py
 This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
 It was prepared as a simplified version of the speedrun for use in neural net optimization research.
 
-hilo: the official track-3 baseline (records/track_3_optimization/train_gpt_simple.py) with Muon removed;
-the hidden matrices are trained by hilo.Hilo with a constant lr.
+Hilo: the official track-3 baseline (records/track_3_optimization/train_gpt_simple.py) with Muon removed;
+the hidden matrices are trained by Hilo.optimizer with a constant lr.
 Model, data, init, AdamW and its schedule, and validation are unchanged; see train_gpt_hilo.diff.
     HILO_NET         path to a HiloNet (.pt, e.g. from meta_train_proxy.py); unset: a randomly
                      initialized HiloNet
@@ -25,7 +25,7 @@ from torch import Tensor, nn
 from torch.optim import AdamW
 import torch.nn.functional as F
 import torch.distributed as dist
-import hilo  # hilo
+import Hilo  # Hilo
 
 
 ########################################
@@ -239,10 +239,10 @@ for _ in range(num_trials):
                         dict(params=[model.proj.weight], lr=0.004),
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
                        betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
-    # hilo: the hidden matrices are trained by Hilo instead of Muon
-    optimizer2 = hilo.Hilo([p for p in model.blocks.parameters() if p.ndim >= 2], total_steps=train_steps,
+    # Hilo: the hidden matrices are trained by Hilo.optimizer instead of Muon
+    optimizer2 = Hilo.optimizer([p for p in model.blocks.parameters() if p.ndim >= 2], total_steps=train_steps,
                            lr=float(os.environ.get("HILO_LR", 1e-3)), net=os.environ.get("HILO_NET") or None)
-    print0(f"hilo net: {optimizer2.net!r}", console=True)
+    print0(f"Hilo net: {optimizer2.net!r}", console=True)
     optimizers = [optimizer1, optimizer2]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())
@@ -258,7 +258,7 @@ for _ in range(num_trials):
             eta = 1.0
         else:
             eta = (1 - progress) / cooldown_frac
-        for opt in [optimizer1]:  # hilo: Hilo's lr stays constant
+        for opt in [optimizer1]:  # Hilo: the Hilo lr stays constant
             for group in opt.param_groups:
                 group["lr"] = group["initial_lr"] * eta
 

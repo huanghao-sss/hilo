@@ -1,4 +1,4 @@
-"""The Hilo optimizer: W <- (1 - lr * weight_decay) * W - lr * U for 2-D parameters, U from a HiloNet."""
+"""Hilo.optimizer: W <- (1 - lr * weight_decay) * W - lr * U for 2-D parameters, U from a HiloNet."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -7,7 +7,7 @@ from typing import Callable, Iterable
 import torch
 from torch import Tensor, nn
 
-from .net import HiloNet
+from .hilonet import HiloNet
 
 
 def assign_owners(shapes: list[tuple[int, int]], world: int) -> list[int]:
@@ -22,8 +22,8 @@ def assign_owners(shapes: list[tuple[int, int]], world: int) -> list[int]:
     return owner
 
 
-class Hilo(torch.optim.Optimizer):
-    """hilo (HiHiTech's Learned Optimizer) for matrix parameters:
+class Optimizer(torch.optim.Optimizer):
+    """Hilo.optimizer, HiHiTech's Learned Optimizer for matrix parameters:
 
         M_beta <- beta * M_beta + (1 - beta) * G     for every beta in net.cfg.betas
         W <- (1 - lr * weight_decay) * W - lr * U,   U = net(G, M, W, t / total_steps)
@@ -47,7 +47,7 @@ class Hilo(torch.optim.Optimizer):
         for group in self.param_groups:
             for p in group["params"]:
                 if p.ndim != 2:
-                    raise ValueError(f"Hilo handles 2-D parameters only, got shape {tuple(p.shape)}")
+                    raise ValueError(f"Hilo.optimizer handles 2-D parameters only, got shape {tuple(p.shape)}")
         self.net = net if isinstance(net, HiloNet) else HiloNet.load(net) if net is not None else HiloNet()
         dist = torch.distributed
         self.rank, self.world = (dist.get_rank(), dist.get_world_size()) if (
@@ -124,7 +124,7 @@ class Hilo(torch.optim.Optimizer):
 
 def split_params(model: nn.Module, exclude: Callable[[str, Tensor], bool] | None = None
                  ) -> tuple[list[Tensor], list[Tensor]]:
-    """(matrices for Hilo, everything else). By default 2-D parameters whose name contains "embed",
+    """(matrices for Hilo.optimizer, everything else). By default 2-D parameters whose name contains "embed",
     "lm_head", "wte" or "wpe" go with the non-matrix ones; pass `exclude(name, p)` to choose yourself."""
     if exclude is None:
         exclude = lambda n, p: any(k in n for k in ("embed", "lm_head", "wte", "wpe"))

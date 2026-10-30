@@ -1,15 +1,12 @@
 """Meta-train a HiloNet for modded-nanogpt on a scaled-down copy of the #36 baseline (one GPU).
 
 The proxy is train_gpt_hilo.py shrunk: same architecture, init, AdamW groups and schedule, loss, and a
-constant Hilo lr; smaller width, depth, batch and steps. With full ES (default) every evaluation trains one
-proxy model from scratch with `Hilo(net=net)` and returns its final validation loss; with PES / NRES the
-runs advance --trunc steps per outer step and return their mean training loss over the segment. Pairs of a
-task share init and data order.
+constant Hilo lr; smaller width, depth, batch and steps. Every ES evaluation trains one proxy model from scratch
+with `Hilo.optimizer(net=net)` and returns its final validation loss. Pairs of a task share init and data order.
 
     # from a modded-nanogpt checkout (needs data/fineweb10B, see the modded-nanogpt README)
     python meta_train_proxy.py --out runs/proxy --iters 100 --pairs 8
     python meta_train_proxy.py --out runs/proxy --devices cuda:0,cuda:1,cuda:2,cuda:3   # parallel evaluations
-    python meta_train_proxy.py --out runs/proxy_nres --estimator nres --trunc 50 --min-steps 100 --iters 2000
     python meta_train_proxy.py --eval runs/proxy/hilo_final.pt --against runs/proxy/hilo_it0010.pt
     HILO_NET=runs/proxy/hilo_final.pt torchrun --nproc_per_node=8 train_gpt_hilo.py
 
@@ -31,9 +28,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-import hilo
-import hilo.meta
-from hilo.net import HiloNetConfig
+import Hilo
+import Hilo.meta
 
 # ----------------------------------------------------------------- architecture of #36 (unchanged)
 
@@ -173,82 +169,40 @@ class Proxy:
         if compile:
             self.model.compile(dynamic=False)
 
-    def _start(self, task_seed: int, horizon: int) -> Tensor:
-        """#36 init and the data order of a run, both drawn from the task seed; returns the batch offsets."""
-        gen = torch.Generator(device=self.dev).manual_seed(task_seed)
-        init_params(self.model, gen)
-        n_tok = self.batch_seqs * self.seq_len
-        return torch.randint(0, self.train.numel() - n_tok - 1, (horizon,), generator=gen, device=self.dev)
-
-    def _optimizers(self, net, horizon: int):
-        model = self.model
+    def __call__(self, net, task_seed: int) -> float:
+        """Train the proxy from scratch with `net` on the hidden matrices; returns final val loss."""
+        model, n_tok = self.model, self.batch_seqs * self.seq_len
+        gen = torch.Generator(device=self.dev).manual_seed(task_seed)  # #36 init and data order of this task
+        init_params(model, gen)
+        starts = torch.randint(0, self.train.numel() - n_tok - 1, (self.steps,), generator=gen, device=self.dev)
         adam = torch.optim.AdamW([dict(params=[model.embed.weight], lr=0.7),
                                   dict(params=[model.proj.weight], lr=0.004),
                                   dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
                                  betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
-        opt = hilo.Hilo([p for p in model.blocks.parameters() if p.ndim >= 2], total_steps=horizon,
-                        lr=self.lr_hidden, net=net)
+        opt = Hilo.optimizer([p for p in model.blocks.parameters() if p.ndim >= 2], total_steps=self.steps,
+                             lr=self.lr_hidden, net=net)
         for g in adam.param_groups:
             g["initial_lr"] = g["lr"]
-        return adam, opt
-
-    def _train(self, adam, opt, starts: Tensor, step0: int, steps: int, horizon: int) -> float:
-        """Steps [step0, step0 + steps) of a run of `horizon` steps; returns their mean training loss."""
-        model, n_tok = self.model, self.batch_seqs * self.seq_len
-        total = torch.zeros((), device=self.dev)
-        for step in range(step0, step0 + steps):
+        for step in range(self.steps):
             buf = self.train[starts[step]:starts[step] + n_tok + 1]
             x, y = buf[:-1].int().view(-1, self.seq_len), buf[1:].long().view(-1, self.seq_len)
             for i in range(0, len(x), self.mbs):
-                loss = model(x[i:i + self.mbs], y[i:i + self.mbs])
-                loss.backward()
-                total += loss.detach()
-            f = step / horizon
+                model(x[i:i + self.mbs], y[i:i + self.mbs]).backward()
+            f = step / self.steps
             eta = 1.0 if f < 1 - self.cooldown_frac else (1 - f) / self.cooldown_frac
             for g in adam.param_groups:
                 g["lr"] = g["initial_lr"] * eta
             adam.step()
             opt.step()
             model.zero_grad(set_to_none=True)
-        return _finite(total.item() / (steps * n_tok))
-
-    def __call__(self, net, task_seed: int) -> float:
-        """Train the proxy from scratch with `net` on the hidden matrices; returns final val loss (full ES)."""
-        starts = self._start(task_seed, self.steps)
-        self._train(*self._optimizers(net, self.steps), starts, 0, self.steps, self.steps)
         with torch.no_grad():
-            loss = sum(self.model(self.val[0][i:i + self.mbs], self.val[1][i:i + self.mbs])
+            loss = sum(model(self.val[0][i:i + self.mbs], self.val[1][i:i + self.mbs])
                        for i in range(0, len(self.val[0]), self.mbs)).item() / self.val[1].numel()
-        return _finite(loss)
-
-    def init(self, task_seed: int, horizon: int) -> dict:
-        """A run for PES / NRES (hilo.meta.TruncatedTask); the run's state is kept off the shared model."""
-        starts = self._start(task_seed, horizon)
-        return dict(model=_clone(self.model.state_dict()), adam=None, hilo=None, starts=starts, step=0,
-                    horizon=horizon)
-
-    def unroll(self, net, st: dict, steps: int) -> tuple[dict, float]:
-        """`steps` more steps of the run with `net`; returns the new state and their mean training loss."""
-        self.model.load_state_dict(st["model"])
-        adam, opt = self._optimizers(net, st["horizon"])
-        if st["adam"] is not None:
-            adam.load_state_dict(st["adam"])
-            opt.load_state_dict(st["hilo"])
-        loss = self._train(adam, opt, st["starts"], st["step"], steps, st["horizon"])
-        return dict(st, model=_clone(self.model.state_dict()), adam=adam.state_dict(), hilo=opt.state_dict(),
-                    step=st["step"] + steps), loss
-
-
-def _clone(sd: dict) -> dict:
-    return {k: v.detach().clone() for k, v in sd.items()}
-
-
-def _finite(x: float) -> float:
-    return x if math.isfinite(x) else float("nan")
+        return loss if math.isfinite(loss) else float("nan")
 
 
 def make_proxy(device: str, **kwargs) -> Proxy:
-    """Builds the proxy inside a meta-training worker process (hilo.meta.EvalPool / UnrollPool)."""
+    """Builds the proxy inside a meta-training worker process (Hilo.meta.EvalPool)."""
     return Proxy(device=device, **kwargs)
 
 
@@ -262,22 +216,16 @@ def main():
     ap.add_argument("--mbs", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-3, help="Hilo lr (use the same one in train_gpt_hilo.py)")
     ap.add_argument("--out", default="runs/proxy")
-    ap.add_argument("--init", default="random", help="starting HiloNet: random, muon (distilled toward Muon "
-                    "first, cached in OUT/init_muon.pt; see hilo.distill) or a saved HiloNet (.pt)")
-    ap.add_argument("--config", help="HiloNetConfig as JSON, e.g. '{\"tie\": 6, \"output_norm\": \"rms\"}'")
+    ap.add_argument("--init", help="a saved HiloNet (.pt) to continue from (default: a random init)")
+    ap.add_argument("--config", help="Hilo.config as JSON, e.g. '{\"tie\": 6, \"output_norm\": \"rms\"}'")
     ap.add_argument("--seed", type=int, default=0, help="random init of the HiloNet and ES noise")
-    ap.add_argument("--estimator", default="es", choices=("es",) + hilo.meta.ESTIMATORS,
-                    help="es: full runs, final val loss; pes / nres: truncated unrolls, mean training loss")
-    ap.add_argument("--trunc", type=int, default=50, help="pes / nres: steps per segment (one outer step each)")
-    ap.add_argument("--min-steps", type=int, help="pes / nres: run lengths log-uniform in [min-steps, steps]")
     ap.add_argument("--iters", type=int, default=100)
     ap.add_argument("--pairs", type=int, default=8)
     ap.add_argument("--sigma-mult", type=float, default=1.0)
-    ap.add_argument("--alpha", type=float, help="outer step in units of sigma (default: 1.0 for es, 0.3 for "
-                    "pes / nres)")
+    ap.add_argument("--alpha", type=float, default=1.0, help="outer step in units of sigma")
     ap.add_argument("--momentum", type=float, default=0.9)
-    ap.add_argument("--optimizer", default="sgdm", choices=hilo.meta.OPTIMIZERS)
-    ap.add_argument("--shaping", default="rms", choices=hilo.meta.SHAPINGS)
+    ap.add_argument("--optimizer", default="sgdm", choices=Hilo.meta.OPTIMIZERS)
+    ap.add_argument("--shaping", default="rms", choices=Hilo.meta.SHAPINGS)
     ap.add_argument("--save-every", type=int, default=10)
     ap.add_argument("--eval", help="evaluate this HiloNet (.pt) on held-out tasks instead of meta-training")
     ap.add_argument("--against", help="with --eval: a second HiloNet, compared pairwise on the same tasks")
@@ -285,19 +233,21 @@ def main():
     ap.add_argument("--devices", help="comma-separated worker devices for parallel ES evaluations, e.g. "
                     "cuda:0,cuda:1 (repeat a GPU to run several evaluations on it at once)")
     ap.add_argument("--precision", default="auto", help="HiloNet matmul precision: auto | bf16 | tf32 | fp32")
-    ap.add_argument("--compile-net", action="store_true", help="torch.compile the HiloNet")
+    ap.add_argument("--backend", default="auto", choices=("auto", "triton", "torch"),
+                    help="HiloNet implementation: auto (Triton kernels on CUDA in bf16) | triton | torch")
+    ap.add_argument("--compile-net", action="store_true", help="torch.compile the HiloNet (torch backend)")
     ap.add_argument("--compile-model", action="store_true", help="torch.compile the proxy GPT")
     ap.add_argument("--nondeterministic", action="store_true", help="allow nondeterministic CUDA kernels")
     a = ap.parse_args()
     proxy_kw = dict(data=a.data, layers=a.layers, dim=a.dim, steps=a.steps, batch_seqs=a.batch_seqs, mbs=a.mbs,
                     lr_hidden=a.lr, deterministic=not a.nondeterministic, compile=a.compile_model)
-    net_options = dict(precision=a.precision, compile=a.compile_net)
+    net_options = dict(precision=a.precision, backend=a.backend, compile=a.compile_net)
 
     if a.eval:
         proxy = Proxy(**proxy_kw)
-        nets = {"eval": hilo.HiloNet.load(a.eval, **net_options)}
+        nets = {"eval": Hilo.net.load(a.eval, **net_options)}
         if a.against:
-            nets["against"] = hilo.HiloNet.load(a.against, **net_options)
+            nets["against"] = Hilo.net.load(a.against, **net_options)
         losses = {k: [] for k in nets}
         for s in range(a.seeds):
             task = 999_000_000 + s  # disjoint from the task seeds used by meta-training
@@ -313,25 +263,15 @@ def main():
         print(json.dumps(summary))
         return
 
-    Path(a.out).mkdir(parents=True, exist_ok=True)
-    net = hilo.init_net(a.init, HiloNetConfig(**json.loads(a.config)) if a.config else None, a.seed,
-                        out=str(Path(a.out) / "init_muon.pt"))
-    print(f"meta-training {net!r} on proxy {a.layers}x{a.dim}, {a.steps} steps, {a.estimator}", flush=True)
-    meta = dict(iters=a.iters, pairs=a.pairs, sigma_mult=a.sigma_mult, momentum=a.momentum, optimizer=a.optimizer,
-                shaping=a.shaping, seed=a.seed, out=a.out, save_every=a.save_every, net_options=net_options)
-    if a.alpha is not None:
-        meta["alpha"] = a.alpha
-    factory = dict(devices=a.devices.split(",")) if a.devices else {}
-    if a.estimator == "es":
-        if a.devices:
-            factory["make_objective"] = functools.partial(make_proxy, **proxy_kw)
-        hilo.meta.meta_train(None if a.devices else Proxy(**proxy_kw), net, **factory, **meta)
-    else:
-        if a.devices:
-            factory["make_task"] = functools.partial(make_proxy, **proxy_kw)
-        hilo.meta.meta_train_truncated(None if a.devices else Proxy(**proxy_kw), net, estimator=a.estimator,
-                                       horizon=(a.min_steps, a.steps) if a.min_steps else a.steps,
-                                       trunc=a.trunc, **factory, **meta)
+    cfg = Hilo.config(**json.loads(a.config)) if a.config else None
+    net = Hilo.net.load(a.init) if a.init else Hilo.net(cfg, a.seed)
+    print(f"meta-training {net!r} on proxy {a.layers}x{a.dim}, {a.steps} steps", flush=True)
+    meta = dict(iters=a.iters, pairs=a.pairs, sigma_mult=a.sigma_mult, alpha=a.alpha, momentum=a.momentum,
+                optimizer=a.optimizer, shaping=a.shaping, seed=a.seed, out=a.out, save_every=a.save_every,
+                net_options=net_options)
+    if a.devices:
+        meta |= dict(make_task=functools.partial(make_proxy, **proxy_kw), devices=a.devices.split(","))
+    Hilo.meta.train(None if a.devices else Proxy(**proxy_kw), net, **meta)
 
 
 if __name__ == "__main__":
