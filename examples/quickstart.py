@@ -1,43 +1,47 @@
-"""Minimal Hilo usage: matrices with Hilo.optimizer, everything else with Adam. Runs on CPU in seconds.
+"""Meta-train a HiloNet, then train a model with it.
 
-    python examples/quickstart.py [--net <hilonet.pt>]
-
-Without --net this uses a randomly initialized HiloNet; examples/meta_train.py meta-trains one.
+    python examples/quickstart.py
 """
-import argparse
 import sys
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import Hilo  # noqa: E402
+import Hilo.meta  # noqa: E402
 
-ap = argparse.ArgumentParser()
-ap.add_argument("--net", help="a saved HiloNet .pt (default: random init)")
-ap.add_argument("--lr", type=float, default=1e-3, help="use the lr the HiloNet was meta-trained with")
-ap.add_argument("--steps", type=int, default=300)
-args = ap.parse_args()
+steps, lr = 50, 1e-3
+gen = torch.Generator().manual_seed(0)
+train_features = torch.randn(256, 32, generator=gen)
+val_features = torch.randn(256, 32, generator=gen)
+true_weight = torch.randn(32, 1, generator=gen)
+train_targets = train_features @ true_weight + 0.1 * torch.randn(256, 1, generator=gen)
+val_targets = val_features @ true_weight + 0.1 * torch.randn(256, 1, generator=gen)
 
-torch.manual_seed(0)
-# teacher-student regression with a 3-layer MLP
-teacher = nn.Sequential(nn.Linear(32, 128), nn.Tanh(), nn.Linear(128, 10))
-model = nn.Sequential(nn.Linear(32, 128), nn.ReLU(), nn.Linear(128, 128), nn.ReLU(), nn.Linear(128, 10))
 
-mats, rest = Hilo.split_params(model)  # 2-D weights -> Hilo.optimizer, biases -> Adam
-opt_mat = Hilo.optimizer(mats, total_steps=args.steps, lr=args.lr, net=args.net)
-opt_rest = torch.optim.Adam(rest, lr=1e-3)
-
-for step in range(args.steps):
-    x = torch.randn(256, 32)
+def objective(net, task_seed):
+    """Return the validation loss."""
+    torch.manual_seed(task_seed)
+    model = nn.Linear(32, 1)
+    mats, rest = Hilo.split_params(model)
+    opt = Hilo.optimizer(mats, total_steps=steps, lr=lr, net=net)
+    adam = torch.optim.Adam(rest, lr=1e-3)
+    for _ in range(steps):
+        F.mse_loss(model(train_features), train_targets).backward()
+        opt.step()
+        adam.step()
+        model.zero_grad(set_to_none=True)
     with torch.no_grad():
-        y = teacher(x)
-    loss = F.mse_loss(model(x), y)
-    loss.backward()
-    opt_mat.step()
-    opt_rest.step()
-    model.zero_grad(set_to_none=True)
-    if step % 50 == 0 or step == args.steps - 1:
-        print(f"step {step:4d}  loss {loss.item():.5f}")
+        return F.mse_loss(model(val_features), val_targets).item()
+
+
+def main():
+    trained = Hilo.meta.train(objective, Hilo.net(seed=0), iters=2, pairs=2, out="runs/quickstart")
+    print(objective(trained, task_seed=1))
+
+
+if __name__ == "__main__":
+    main()

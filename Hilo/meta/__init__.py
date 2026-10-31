@@ -1,9 +1,9 @@
-"""Meta-training of the HiloNet with full-unroll antithetic ES (no backpropagation through training).
+"""Meta-training of the HiloNet with ES (evolution strategies; no backpropagation through training).
 
     Hilo.meta.train(objective, net)
 
 The outer optimizer (sgdm | adam), fitness shaping (rms | rank | none) and worker processes (make_task +
-devices) are options of train. The building blocks (FullES, Outer, minimize, EvalPool) compose for other loops.
+devices) are options of train. The building blocks (ES, Outer, minimize, EvalPool) compose for other loops.
 """
 from __future__ import annotations
 
@@ -12,10 +12,10 @@ from typing import Callable
 
 from ..hilonet import HiloNet, es_sigma
 from .core import OPTIMIZERS, SHAPINGS, Outer, minimize, resume, shape
-from .es import FullES
+from .es import ES
 from .pool import EvalPool
 
-__all__ = ["train", "OPTIMIZERS", "SHAPINGS", "FullES", "Outer", "minimize", "shape", "EvalPool"]
+__all__ = ["train", "OPTIMIZERS", "SHAPINGS", "ES", "Outer", "minimize", "shape", "EvalPool"]
 
 
 def train(objective: Callable[[HiloNet, int], float] | None = None, net: HiloNet | None = None, *,
@@ -23,11 +23,13 @@ def train(objective: Callable[[HiloNet, int], float] | None = None, net: HiloNet
           optimizer: str = "sgdm", shaping: str = "rms", seed: int = 0, out: str | Path | None = None,
           save_every: int = 50, make_task: Callable[[str], Callable[[HiloNet, int], float]] | None = None,
           devices: list[str] | None = None, net_options: dict | None = None) -> HiloNet:
-    """Meta-train a HiloNet (default: Hilo.net(), the random init with the default config) with full-unroll ES.
+    """Meta-train a HiloNet (default: Hilo.net(), the random init with the default config) with ES (evolution strategies).
 
-    objective(net, task_seed) -> the loss at the end of a whole training run with `net` (Hilo.meta.es).
-    Serial: `objective` runs in this process. Parallel: make_task(device) builds one objective in each worker
-    process of `devices` (e.g. ["cuda:0", "cuda:1"]).
+    objective(net, task_seed) -> the validation loss at the end of one training run. You write this function.
+    Pass `net` to Hilo.optimizer, and seed the model and its data order with task_seed. The same net and
+    task_seed must return the same loss.
+    Serial: `objective` runs in this process. Parallel: make_task(device) builds one such function in each
+    worker process of `devices` (e.g. ["cuda:0", "cuda:1"]).
     alpha: outer step in units of sigma.
     optimizer / shaping / momentum: see Hilo.meta.core.
     net_options: execution options of the evaluated nets (precision, compile, max_coords).
@@ -46,7 +48,7 @@ def train(objective: Callable[[HiloNet, int], float] | None = None, net: HiloNet
             return [objective(HiloNet(cfg, phi=theta, **net_options), task_seed) for theta, task_seed in jobs]
     else:
         run = EvalPool(make_task, devices or ["cuda:0"], cfg, net_options)
-    est = FullES(run, sigma, pairs, seed, shaping)
+    est = ES(run, sigma, pairs, seed, shaping)
 
     def save(it, theta):
         if out and (it + 1) % save_every == 0:

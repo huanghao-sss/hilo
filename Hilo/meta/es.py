@@ -1,4 +1,4 @@
-"""Full-unroll antithetic ES on the loss at the end of training.
+"""ES (evolution strategies) on the loss at the end of training.
 
 Each iteration evaluates `pairs` antithetic pairs phi +/- sigma * eps. Both members of a pair train on the
 same task (same init seed and data order: common random numbers), so their difference measures the
@@ -16,7 +16,7 @@ from .core import penalize, shape
 Evaluate = Callable[[list[tuple[torch.Tensor, int]]], list[float]]
 
 
-class FullES:
+class ES:
     """d = mean_i z_i eps_i over antithetic pairs; evaluate([(theta, task_seed), ...]) -> final losses."""
 
     def __init__(self, evaluate: Evaluate, sigma: torch.Tensor, pairs: int = 8, seed: int = 0,

@@ -1,6 +1,6 @@
 """The outer loop: fitness shaping, the outer optimizer and logging.
 
-An estimator (FullES) maps theta to a search direction d in noise units (d ~ sigma * grad / 2 for shaping="none");
+An estimator (ES) maps theta to a search direction d in noise units (d ~ sigma * grad / 2 for shaping="none");
 the outer optimizer steps theta -= alpha * sigma * step(d), so alpha is measured in units of sigma whatever
 the optimizer.
 """

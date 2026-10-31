@@ -1,7 +1,5 @@
 # Using Hilo in modded-nanogpt
 
-English | [简体中文](README.zh-CN.md)
-
 The example is the **official baseline** #36 of modded-nanogpt Track 3 (the optimization track),
 [`records/track_3_optimization/train_gpt_simple.py`](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/track_3_optimization/train_gpt_simple.py):
 a GPT with 12 layers × 768 dims, 524288 tokens per step, 3250 steps; embeddings / output head / gains and biases use
@@ -22,8 +20,7 @@ AdamW, and the hidden matrices originally use Muon.
 3. The original "stable, then linear decay" learning-rate schedule applies only to AdamW; the lr of
    `Hilo.optimizer` stays constant.
 
-Model, data, init, AdamW and validation are unchanged. After the gradient all-reduce, `optimizer2.step()` splits the
-HiloNet computation across GPUs and broadcasts the results.
+Model, data, init, AdamW and validation are unchanged.
 
 ## Running
 
@@ -58,9 +55,8 @@ python meta_train_proxy.py --init runs/proxy/hilo_final.pt --steps 600 --out run
 python meta_train_proxy.py --eval runs/proxy2/hilo_final.pt --against runs/proxy/hilo_final.pt --seeds 8
 ```
 
-For the meaning and values of the outer-optimizer options `--optimizer sgdm|adam`,
-`--shaping rms|rank|none`, `--alpha`, `--momentum`, and reading the log, see the
-[meta-training tutorial](../../docs/meta_training.md).
+`--optimizer`, `--shaping`, `--alpha` and `--momentum` are the arguments of `Hilo.meta.train` (`Hilo/meta`).
+Each outer step appends one line to `out/log.jsonl`.
 `--eval` evaluates on held-out tasks disjoint from meta-training (final validation loss); with `--against`, two
 HiloNets are compared pairwise on the same tasks.
 
@@ -68,20 +64,10 @@ Options related to efficiency:
 
 - `--devices cuda:0,cuda:1,...`: spread the evaluations of one outer step over several worker processes; a GPU may be
   listed several times.
-- `--precision`, `--backend`, `--compile-net`: execution options of the HiloNet, see the main README. At 4 layers ×
-  256 dims the HiloNet takes about 75 ms per proxy step with the Triton kernels (the default on CUDA; about 450 ms
-  with the PyTorch implementation), against about 160 ms for the model's forward and backward.
+- `--precision`, `--backend`, `--compile-net`: execution options of the HiloNet. Pass the same values when using the saved net.
 - `--compile-model`: compile the proxy GPT.
 - Evaluations use deterministic CUDA kernels by default, so the same net on the same task gives exactly the same
   result; `--nondeterministic` turns this off.
 
 The closer the proxy is to the target setting, the better the transfer; a common recipe is to train on a small proxy
 first, then continue on progressively wider and longer proxies.
-
-## Cost
-
-The HiloNet's cost grows with matrix size. The 12 × 768 model has 72 matrices: with the Triton kernels a step takes
-3.4 s on one A100 (measured while sharing the GPU; 12.7 s with the PyTorch bf16 implementation), about 0.45 s sharded
-over 8 GPUs. Most of it is the attention matmuls of the 3072 × 768 matrices, which already run near the GPU's matmul
-throughput; to go further, reduce the architecture's flops (`tie`, `d` in `Hilo.config`), which needs
-meta-training for that config.
