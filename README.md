@@ -25,7 +25,7 @@ flowchart TB
   subgraph step ["One inner step on a matrix"]
     channels["G, gradient EMAs, W"] --> norm["divide each by its own RMS and clip"]
     norm --> embed["embed every coordinate"]
-    context["log of rms M / rms G, log of rms W, t/T, 1 − t/T, log of m/n"] --> embed
+    context["log of rms M / rms G, log of rms W, t/T, log of m/n"] --> embed
     embed --> block["row attention, column attention, MLP — repeated"]
     block --> update["U"]
     update --> apply["W ← W − lr·U"]

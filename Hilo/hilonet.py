@@ -2,7 +2,7 @@
 
 Per matrix W (m x n) every coordinate carries the channels [G, M_beta_1, ..., M_beta_k, W] (M_beta are EMAs
 of the gradient), each divided by its tensor RMS and clipped at +-20 (scale equivariance). A global context
-vector carries log(rms M_beta / rms G), log(rms W + 1e-4), progress t/T, 1 - t/T and log(m/n).
+vector carries log(rms M_beta / rms G), log(rms W + 1e-4), progress t/T and log(m/n).
 Coordinates are embedded to d dimensions and mixed by blocks of [row attention -> column attention -> MLP]
 with residuals and RMSNorm. Row attention treats rows as tokens and scores row pairs by channel bilinear
 forms summed over all columns (with one channel and linear attention the score matrix is X X^T), so the
@@ -56,7 +56,7 @@ class HiloNetConfig:
 
     @property
     def n_glob(self) -> int:
-        return len(self.betas) + 4
+        return len(self.betas) + 3
 
 
 def param_spec(cfg: HiloNetConfig) -> list[tuple[str, tuple]]:
@@ -157,14 +157,14 @@ def channels(G: Tensor, M: Tensor, W: Tensor, clip: float = 20.0) -> tuple[Tenso
 
 
 def features(G: Tensor, M: Tensor, W: Tensor, progress: float, clip: float = 20.0) -> tuple[Tensor, Tensor]:
-    """-> (chan [B, m, n, k + 2], glob [B, k + 4])."""
+    """-> (chan [B, m, n, k + 2], glob [B, k + 3])."""
     B, m, n = G.shape
     k = M.shape[-1]
     chan, r = channels(G, M, W, clip)
     lg = torch.log(r[:, 1:1 + k].clamp_min(1e-30) / r[:, :1].clamp_min(1e-30))
     lw = torch.log(r[:, -1:] + 1e-4)
     f = torch.tensor(progress, device=G.device, dtype=torch.float32)
-    ctx = torch.stack([f, 1 - f, torch.full_like(f, math.log(m / n))]).expand(B, 3)
+    ctx = torch.stack([f, torch.full_like(f, math.log(m / n))]).expand(B, 2)
     return chan, torch.cat([lg, lw, ctx], -1)
 
 
