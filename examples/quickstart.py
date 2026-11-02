@@ -39,7 +39,9 @@ def objective(net, task_seed):
 
 
 def main():
-    trained = Hilo.meta.train(objective, Hilo.net(seed=0), iters=2, pairs=2, out="runs/quickstart")
+    net = Hilo.net(seed=0)
+    trained = Hilo.meta.train(objective, net, sigma=Hilo.meta.es_sigma(net.cfg, 0.02, 0.01),
+                              iters=2, pairs=2, out="runs/quickstart")
     print(objective(trained, task_seed=1))
 
 

@@ -55,8 +55,10 @@ python meta_train_proxy.py --init runs/proxy/hilo_final.pt --steps 600 --out run
 python meta_train_proxy.py --eval runs/proxy2/hilo_final.pt --against runs/proxy/hilo_final.pt --seeds 8
 ```
 
-`--optimizer`, `--shaping`, `--alpha` and `--momentum` are the arguments of `Hilo.meta.train` (`Hilo/meta`).
-Each outer step appends one line to `out/log.jsonl`.
+`--es-matrix` and `--es-vector` are the ES scales on 2-D and 1-D HiloNet tensors. `--optimizer` selects the `torch.optim` class the script passes to `Hilo.meta.train`
+(`sgd`, the default, or `adam`). `--alpha` is that optimizer's learning rate (default `1e-3`). For SGD it counts steps in units of the ES
+perturbation scale. `--momentum` is forwarded to that optimizer. `--shaping` is the other argument of `Hilo.meta.train`
+(`Hilo/meta`). Each iteration appends one line to `out/log.jsonl`.
 `--eval` evaluates on held-out tasks disjoint from meta-training (final validation loss); with `--against`, two
 HiloNets are compared pairwise on the same tasks.
 

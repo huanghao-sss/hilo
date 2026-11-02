@@ -14,7 +14,7 @@ weight initialization and a new data order. Hilo minimizes the average loss over
 |---|---|
 | `Hilo.optimizer` | The optimizer, a `torch.optim.Optimizer` |
 | `Hilo.net` / `Hilo.config` | Configurable HiloNet architecture |
-| `Hilo.meta` | Meta-training (`Hilo.meta.train`) |
+| `Hilo.meta` | Meta-training. An estimator returns a meta-gradient and `minimize` writes it to `theta.grad`. `ES` estimates the Gaussian-smoothed family loss from final losses |
 
 ## Architecture
 
@@ -86,17 +86,38 @@ def objective(net, task_seed):
     with torch.no_grad():
         return F.mse_loss(model(val_features), val_targets).item()
 
-trained = Hilo.meta.train(objective, Hilo.net(seed=0), iters=2, pairs=2, out="runs/quickstart")
+net = Hilo.net(seed=0)
+trained = Hilo.meta.train(objective, net, sigma=Hilo.meta.es_sigma(net.cfg, 0.02, 0.01),
+                          iters=2, pairs=2, out="runs/quickstart")
 print(objective(trained, task_seed=1))
 ```
 
 `python examples/quickstart.py` runs this.
+
+`Hilo.meta.train` is ES followed by `torch.optim.SGD` (default, no momentum). Pass a `torch.optim.Optimizer` subclass or a `params -> Optimizer` callable as `optimizer` to use another one. An estimator is called as `(theta, it) -> (gradient, log)`, and that gradient is written to `theta.grad`, so another estimator or another PyTorch optimizer replaces either piece. `evaluate([(phi, task_seed), ...])` calls `objective` and returns the losses. ES multiplies its estimate by `sigma` before returning it. For SGD, `lr` counts steps in units of `sigma`. The `sigma` passed to `minimize` only scales the logged drift.
+
+```python
+def evaluate(jobs):
+    return [objective(Hilo.net(phi=phi), task_seed) for phi, task_seed in jobs]
+
+net = Hilo.net(seed=0)
+theta = torch.nn.Parameter(net.flat())
+sigma = Hilo.meta.es_sigma(net.cfg, matrix=0.02, vector=0.01)
+estimator = Hilo.meta.ES(evaluate, sigma, pairs=8)
+optimizer = torch.optim.SGD([theta], lr=1e-3)
+Hilo.meta.minimize(estimator, optimizer, theta, iters=100, sigma=sigma, out="runs/exp")
+```
 
 ## modded-nanogpt example
 
 [`examples/modded_nanogpt/`](examples/modded_nanogpt/README.md): the official baseline of modded-nanogpt Track 3
 (#36, `train_gpt_simple.py`) with its hidden matrices trained by `Hilo.optimizer` (changes in
 `train_gpt_hilo.diff`), plus a script that meta-trains a HiloNet on a scaled-down copy of the baseline.
+
+## CIFAR-10 airbench example
+
+[`examples/cifar10_airbench/`](examples/cifar10_airbench/README.md): the airbench94 Muon speedrun (94% on CIFAR-10)
+with its convolution matrices trained by `Hilo.optimizer`. Meta-training uses that full schedule directly.
 
 ## License
 

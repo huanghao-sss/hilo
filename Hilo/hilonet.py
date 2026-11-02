@@ -33,8 +33,8 @@ class HiloNetConfig:
     d: int = 16                      # embedding width per coordinate
     heads: int = 2
     mlp_hidden: int = 32
-    blocks: int = 2                  # number of distinct blocks (ignored when tie > 0)
-    tie: int = 12                    # > 0: one shared block applied `tie` times
+    blocks: int = 2                  # distinct blocks in one pass
+    tie: int = 2                     # the pass is repeated this many times (0: once)
     attn: str = "linear"             # "linear" (scores / m) or "softmax"
     betas: tuple = (0.5, 0.9, 0.99, 0.999)
     clip: float = 20.0
@@ -44,11 +44,13 @@ class HiloNetConfig:
     def __post_init__(self):
         self.betas = tuple(float(b) for b in self.betas)
         assert self.d % self.heads == 0 and self.attn in ("linear", "softmax")
+        assert self.blocks >= 1 and self.tie >= 0, (self.blocks, self.tie)
         assert self.output_norm in OUTPUT_NORMS, (self.output_norm, OUTPUT_NORMS)
 
     @property
     def iters(self) -> int:
-        return self.tie or self.blocks
+        """Applications of a block: `blocks` distinct blocks, the pass repeated `tie` times (once if tie is 0)."""
+        return self.blocks * (self.tie or 1)
 
     @property
     def channels(self) -> list[str]:
@@ -63,7 +65,7 @@ def param_spec(cfg: HiloNetConfig) -> list[tuple[str, tuple]]:
     """Names and shapes of the flat parameter vector (order matters)."""
     d, h = cfg.d, cfg.mlp_hidden
     out = [("E", (len(cfg.channels), d)), ("Eg", (cfg.n_glob, d))]
-    for b in range(1 if cfg.tie else cfg.blocks):
+    for b in range(cfg.blocks):
         for ax in ("r", "c"):
             out += [(f"{b}{ax}q", (d, d)), (f"{b}{ax}k", (d, d)), (f"{b}{ax}v", (d, d)), (f"{b}{ax}o", (d, d))]
         out += [(f"{b}m1", (d, h)), (f"{b}mb1", (h,)), (f"{b}m2", (h, d)), (f"{b}mb2", (d,))]
@@ -91,12 +93,6 @@ def init_flat(cfg: HiloNetConfig | None = None, seed: int = 0) -> Tensor:
             t = torch.zeros(shp)
         parts.append(t.reshape(-1))
     return torch.cat(parts)
-
-
-def es_sigma(cfg: HiloNetConfig | None = None) -> Tensor:
-    """Default per-parameter ES noise scale: 0.02 for matrices, 0.01 for vectors (scale with sigma_mult)."""
-    return torch.cat([torch.full((math.prod(s),), 0.02 if len(s) == 2 else 0.01)
-                      for _, s in param_spec(cfg or HiloNetConfig())])
 
 
 def _cn(h: Tensor) -> Tensor:
@@ -134,14 +130,15 @@ def head_weights(phi: dict, heads: int, dt: torch.dtype = torch.float32) -> dict
     return w
 
 
-def hilo_net(chan: Tensor, glob: Tensor, phi: dict, w: dict, *, iters: int, tie: bool, heads: int, attn: str,
+def hilo_net(chan: Tensor, glob: Tensor, phi: dict, w: dict, *, blocks: int, tie: int, heads: int, attn: str,
              dt: torch.dtype = torch.float32) -> Tensor:
     """chan [B, m, n, C] normalized channels, glob [B, n_glob] -> raw update X [B, m, n].
-    phi: parameters; w: per-head attention weights in dtype dt (head_weights). The residual stream,
-    norms and MLP stay in float32; attention matmuls run in dt."""
+    phi: parameters; w: per-head attention weights in dtype dt (head_weights). `blocks` distinct blocks are
+    applied in order, and that pass is repeated `tie` times (once if tie is 0). The residual stream, norms
+    and MLP stay in float32; attention matmuls run in dt."""
     h = chan @ phi["E"] + (glob @ phi["Eg"])[:, None, None, :]
-    for i in range(iters):
-        b = 0 if tie else i
+    for i in range(blocks * (tie or 1)):
+        b = i % blocks
         h = h + _attn(_cn(h), w, f"{b}r", heads, attn, dt)
         h = h + _attn(_cn(h).transpose(1, 2), w, f"{b}c", heads, attn, dt).transpose(1, 2)
         z = F.silu(_cn(h) @ phi[f"{b}m1"] + phi[f"{b}mb1"])
@@ -276,7 +273,7 @@ class HiloNet:
             Us = []
             for i in range(0, B, step):
                 chan, glob = features(G[i:i + step], M[i:i + step], W[i:i + step], progress, self.cfg.clip)
-                kw = dict(iters=self.cfg.iters, tie=bool(self.cfg.tie), heads=self.cfg.heads, attn=self.cfg.attn)
+                kw = dict(blocks=self.cfg.blocks, tie=self.cfg.tie, heads=self.cfg.heads, attn=self.cfg.attn)
                 if self._triton is not None:
                     X = self._triton(chan, glob, self.phi, **kw)
                 else:

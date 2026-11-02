@@ -82,9 +82,10 @@ def supported(cfg) -> bool:
     return p2(cfg.d) and p2(cfg.mlp_hidden) and cfg.d % cfg.heads == 0
 
 
-def hilo_net_triton(chan: Tensor, glob: Tensor, phi: dict, *, iters: int, tie: bool, heads: int,
+def hilo_net_triton(chan: Tensor, glob: Tensor, phi: dict, *, blocks: int, tie: int, heads: int,
                     attn: str) -> Tensor:
-    """hilo_net(chan, glob, phi, ..., dt=torch.bfloat16) on CUDA: chan [B, m, n, C], glob [B, n_glob] -> X [B, m, n]."""
+    """hilo_net(chan, glob, phi, ..., dt=torch.bfloat16) on CUDA: chan [B, m, n, C], glob [B, n_glob] -> X [B, m, n].
+    `blocks` distinct blocks, the pass repeated `tie` times (once if tie is 0)."""
     B, m, n, C = chan.shape
     D, HID = phi["E"].shape[1], phi["0m1"].shape[1]
     DK, dev, bf = D // heads, chan.device, torch.bfloat16
@@ -119,8 +120,10 @@ def hilo_net_triton(chan: Tensor, glob: Tensor, phi: dict, *, iters: int, tie: b
             A = torch.softmax(A.float(), dim=-1).to(bf)
         torch.bmm(A, v, out=O.view(heads * B, T, F * DK))
 
+    iters = blocks * (tie or 1)
+
     def blk(it):
-        return 0 if tie else it
+        return it % blocks
 
     launch(embed=True, qkv=f"{blk(0)}r")
     for it in range(iters):

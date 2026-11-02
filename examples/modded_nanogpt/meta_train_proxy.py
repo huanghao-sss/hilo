@@ -221,10 +221,12 @@ def main():
     ap.add_argument("--seed", type=int, default=0, help="random init of the HiloNet and ES noise")
     ap.add_argument("--iters", type=int, default=100)
     ap.add_argument("--pairs", type=int, default=8)
-    ap.add_argument("--sigma-mult", type=float, default=1.0)
-    ap.add_argument("--alpha", type=float, default=1.0, help="outer step in units of sigma")
-    ap.add_argument("--momentum", type=float, default=0.9)
-    ap.add_argument("--optimizer", default="sgdm", choices=Hilo.meta.OPTIMIZERS)
+    ap.add_argument("--es-matrix", type=float, default=0.02, help="ES scale on 2-D HiloNet tensors")
+    ap.add_argument("--es-vector", type=float, default=0.01, help="ES scale on 1-D HiloNet tensors")
+    ap.add_argument("--alpha", type=float, default=1e-3, help="outer learning rate")
+    ap.add_argument("--momentum", type=float, default=0.0)
+    ap.add_argument("--optimizer", default="sgd", choices=("sgd", "adam"),
+                    help="torch.optim class passed to Hilo.meta.train")
     ap.add_argument("--shaping", default="rms", choices=Hilo.meta.SHAPINGS)
     ap.add_argument("--save-every", type=int, default=10)
     ap.add_argument("--eval", help="evaluate this HiloNet (.pt) on held-out tasks instead of meta-training")
@@ -266,8 +268,13 @@ def main():
     cfg = Hilo.config(**json.loads(a.config)) if a.config else None
     net = Hilo.net.load(a.init) if a.init else Hilo.net(cfg, a.seed)
     print(f"meta-training {net!r} on proxy {a.layers}x{a.dim}, {a.steps} steps", flush=True)
-    meta = dict(iters=a.iters, pairs=a.pairs, sigma_mult=a.sigma_mult, alpha=a.alpha, momentum=a.momentum,
-                optimizer=a.optimizer, shaping=a.shaping, seed=a.seed, out=a.out, save_every=a.save_every,
+    def outer(params):
+        if a.optimizer == "adam":
+            return torch.optim.Adam(params, lr=a.alpha, betas=(a.momentum or 0.9, 0.999))
+        return torch.optim.SGD(params, lr=a.alpha, momentum=a.momentum, dampening=a.momentum)
+
+    meta = dict(iters=a.iters, pairs=a.pairs, sigma=Hilo.meta.es_sigma(net.cfg, a.es_matrix, a.es_vector),
+                alpha=a.alpha, optimizer=outer, shaping=a.shaping, seed=a.seed, out=a.out, save_every=a.save_every,
                 net_options=net_options)
     if a.devices:
         meta |= dict(make_task=functools.partial(make_proxy, **proxy_kw), devices=a.devices.split(","))
